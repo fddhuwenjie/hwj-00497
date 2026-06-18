@@ -559,13 +559,14 @@ class XRefEntry:
     in_use: bool
     is_compressed: bool = False
     stream_num: int = 0
+    source: str = "direct"
 
     def __repr__(self):
         if self.is_compressed:
-            return f"[{self.obj_num}] compressed in stream {self.stream_num}, index {self.offset}"
+            return f"[{self.obj_num}] compressed in stream {self.stream_num}, index {self.offset} (source: {self.source})"
         if self.in_use:
-            return f"[{self.obj_num}] offset={self.offset}, gen={self.gen_num}"
-        return f"[{self.obj_num}] free, next={self.offset}, gen={self.gen_num}"
+            return f"[{self.obj_num}] offset={self.offset}, gen={self.gen_num} (source: {self.source})"
+        return f"[{self.obj_num}] free, next={self.offset}, gen={self.gen_num} (source: {self.source})"
 
 
 @dataclass
@@ -591,6 +592,7 @@ class PDFDocument:
         self.trailer: Optional[PDFDict] = None
         self.xref_entries: Dict[int, XRefEntry] = {}
         self.objects: Dict[Tuple[int, int], PDFObject] = {}
+        self.object_sources: Dict[Tuple[int, int], str] = {}
         self.catalog_ref: Optional[PDFIndirectRef] = None
         self.catalog: Optional[PDFDict] = None
         self.pages: List[PDFPage] = []
@@ -676,7 +678,7 @@ class PDFDocument:
                     off = int(entry_parts[0])
                     gen = int(entry_parts[1])
                     in_use = entry_parts[2] == b'n'
-                    self.xref_entries[obj_num] = XRefEntry(obj_num, off, gen, in_use)
+                    self.xref_entries[obj_num] = XRefEntry(obj_num, off, gen, in_use, source="direct_table")
                 except:
                     continue
         trailer_parser = Parser(self.data[pos:])
@@ -733,11 +735,11 @@ class PDFDocument:
                         fields.append(val)
                 ftype, f1, f2 = fields[0], fields[1], fields[2]
                 if ftype == 0:
-                    self.xref_entries[obj_num] = XRefEntry(obj_num, f1, f2, False)
+                    self.xref_entries[obj_num] = XRefEntry(obj_num, f1, f2, False, source="xref_stream")
                 elif ftype == 1:
-                    self.xref_entries[obj_num] = XRefEntry(obj_num, f1, f2, True)
+                    self.xref_entries[obj_num] = XRefEntry(obj_num, f1, f2, True, source="xref_stream")
                 elif ftype == 2:
-                    xentry = XRefEntry(obj_num, f2, 0, True, True, f1)
+                    xentry = XRefEntry(obj_num, f2, 0, True, True, f1, source="xref_stream")
                     self.xref_entries[obj_num] = xentry
         if '/Root' in stream.dict and self.trailer is None:
             self.trailer = stream.dict
@@ -755,6 +757,16 @@ class PDFDocument:
                 ind_obj = parser.parse_indirect_object()
                 if ind_obj:
                     self.objects[(obj_num, ind_obj.gen_num)] = ind_obj.obj
+                    self.object_sources[(obj_num, ind_obj.gen_num)] = entry.source
+            except Exception as e:
+                pass
+        for obj_num, entry in self.xref_entries.items():
+            if not entry.in_use or not entry.is_compressed:
+                continue
+            try:
+                obj = self._resolve_compressed(entry)
+                if not isinstance(obj, PDFNull):
+                    self.objects[(obj_num, 0)] = obj
             except Exception as e:
                 pass
 
@@ -772,6 +784,7 @@ class PDFDocument:
                     ind_obj = parser.parse_indirect_object()
                     if ind_obj:
                         self.objects[key] = ind_obj.obj
+                        self.object_sources[key] = entry.source
                         return ind_obj.obj
                 except:
                     pass
@@ -779,38 +792,71 @@ class PDFDocument:
                 return self._resolve_compressed(entry)
         return PDFNull()
 
-    def _resolve_compressed(self, entry: XRefEntry) -> PDFObject:
-        stream_obj_key = (entry.stream_num, 0)
+    def _get_obj_stream(self, stream_num: int) -> Optional[PDFStream]:
+        stream_obj_key = (stream_num, 0)
         if stream_obj_key not in self.objects:
-            if entry.stream_num in self.xref_entries:
-                sref_entry = self.xref_entries[entry.stream_num]
-                parser = Parser(self.data[sref_entry.offset:], self)
-                ind_obj = parser.parse_indirect_object()
-                if ind_obj:
-                    self.objects[stream_obj_key] = ind_obj.obj
+            if stream_num in self.xref_entries:
+                sref_entry = self.xref_entries[stream_num]
+                if sref_entry.in_use and not sref_entry.is_compressed:
+                    parser = Parser(self.data[sref_entry.offset:], self)
+                    ind_obj = parser.parse_indirect_object()
+                    if ind_obj:
+                        self.objects[stream_obj_key] = ind_obj.obj
+                        self.object_sources[stream_obj_key] = sref_entry.source
         if stream_obj_key not in self.objects:
-            return PDFNull()
+            return None
         stream = self.objects[stream_obj_key]
-        if not isinstance(stream, PDFStream):
+        if isinstance(stream, PDFStream):
+            return stream
+        return None
+
+    def _resolve_compressed(self, entry: XRefEntry) -> PDFObject:
+        stream = self._get_obj_stream(entry.stream_num)
+        if stream is None:
             return PDFNull()
-        data = stream.get_filtered_data()
-        parser = Parser(data, self)
-        obj_idx = entry.offset
-        count_arr = stream.dict.get('N', None)
-        if isinstance(count_arr, PDFNumber):
-            pass
-        idx_arr = stream.dict.get('Index', None)
-        offsets = None
-        if 'W' in stream.dict:
-            pass
-        for i in range(obj_idx + 1):
+        try:
+            data = stream.get_filtered_data()
+        except Exception:
+            return PDFNull()
+        n = 0
+        first = 0
+        if '/N' in stream.dict:
+            n_obj = stream.dict['/N']
+            if isinstance(n_obj, PDFNumber):
+                n = int(n_obj.value)
+        if '/First' in stream.dict:
+            first_obj = stream.dict['/First']
+            if isinstance(first_obj, PDFNumber):
+                first = int(first_obj.value)
+        obj_index = entry.offset
+        obj_num_in_stream = None
+        obj_offset_in_stream = None
+        header_parser = Parser(data[:first], self)
+        for i in range(n):
             try:
-                obj = parser.parse_object()
-                if i == obj_idx:
-                    return obj
-            except:
+                tok1_t, tok1_v = header_parser.next_token()
+                tok2_t, tok2_v = header_parser.next_token()
+                if tok1_t == 'NUMBER' and tok2_t == 'NUMBER':
+                    onum = int(tok1_v.value)
+                    ooff = int(tok2_v.value)
+                    if i == obj_index:
+                        obj_num_in_stream = onum
+                        obj_offset_in_stream = ooff
+                else:
+                    break
+            except Exception:
                 break
-        return PDFNull()
+        if obj_offset_in_stream is None:
+            return PDFNull()
+        obj_start = first + obj_offset_in_stream
+        try:
+            obj_parser = Parser(data[obj_start:], self)
+            resolved = obj_parser.parse_object()
+            if obj_num_in_stream is not None:
+                self.object_sources[(obj_num_in_stream, 0)] = f"compressed_in_{entry.stream_num}"
+            return resolved
+        except Exception:
+            return PDFNull()
 
     def _parse_pages(self):
         if not self.catalog or '/Pages' not in self.catalog:
@@ -972,13 +1018,42 @@ class ContentStreamParser:
         self.doc = doc
         self.page = page
         self.text_blocks = []
-        self.current_text = ""
         self.font_map = {}
         self.current_font = None
         self.current_font_size = 12
         self.tm = [1, 0, 0, 1, 0, 0]
-        self.td_y = 0
         self._in_text = False
+        self._current_lines = []
+        self._current_line_parts = []
+        self._last_text_x = None
+        self._last_text_y = None
+
+    def _newline_threshold(self):
+        return max(self.current_font_size * 0.8, 2.0)
+
+    def _space_threshold(self):
+        return self.current_font_size * 0.25
+
+    def _flush_line(self):
+        if self._current_line_parts:
+            line_text = ''.join(self._current_line_parts)
+            self._current_lines.append(line_text)
+            self._current_line_parts = []
+
+    def _get_block_text(self):
+        self._flush_line()
+        return '\n'.join(self._current_lines)
+
+    def _check_position_change(self):
+        if self._last_text_y is not None and self._current_line_parts:
+            dy = abs(self.tm[5] - self._last_text_y)
+            if dy > self._newline_threshold():
+                self._flush_line()
+                self._last_text_x = None
+            elif self._last_text_x is not None:
+                dx = self.tm[4] - self._last_text_x
+                if dx > self._space_threshold():
+                    self._current_line_parts.append(' ')
 
     def parse(self, data: bytes):
         self.fonts = {}
@@ -1042,13 +1117,17 @@ class ContentStreamParser:
     def _handle_operator(self, op: str, operands):
         if op == 'BT':
             self._in_text = True
-            self.current_text = ""
             self.tm = [1, 0, 0, 1, 0, 0]
+            self._current_lines = []
+            self._current_line_parts = []
+            self._last_text_x = None
+            self._last_text_y = None
         elif op == 'ET':
             self._in_text = False
-            if self.current_text:
+            block_text = self._get_block_text()
+            if block_text:
                 self.text_blocks.append({
-                    'text': self.current_text,
+                    'text': block_text,
                     'x': self.tm[4],
                     'y': self.tm[5],
                     'font': self.current_font,
@@ -1067,41 +1146,67 @@ class ContentStreamParser:
                 ty = float(operands[1].value) if isinstance(operands[1], PDFNumber) else 0
                 self.tm[4] += tx
                 self.tm[5] += ty
+                self._check_position_change()
         elif op == 'TD':
             if len(operands) >= 2:
                 tx = float(operands[0].value) if isinstance(operands[0], PDFNumber) else 0
                 ty = float(operands[1].value) if isinstance(operands[1], PDFNumber) else 0
                 self.tm[4] += tx
                 self.tm[5] += ty
+                self._check_position_change()
         elif op == 'Tm':
             if len(operands) >= 6:
+                old_y = self.tm[5]
                 self.tm = [float(o.value) if isinstance(o, PDFNumber) else 0 for o in operands[:6]]
+                self._check_position_change()
         elif op == 'T*':
             self.tm[5] -= self.current_font_size
+            self._flush_line()
+            self._last_text_x = None
+            self._last_text_y = self.tm[5]
         elif op == 'Tj':
             if operands and isinstance(operands[0], PDFString):
                 text = self._decode_string(operands[0])
-                self.current_text += text
+                if text:
+                    self._check_position_change()
+                    self._current_line_parts.append(text)
+                    self._last_text_x = self.tm[4]
+                    self._last_text_y = self.tm[5]
         elif op == 'TJ':
             if operands and isinstance(operands[0], PDFArray):
                 for item in operands[0]:
                     if isinstance(item, PDFString):
                         text = self._decode_string(item)
-                        self.current_text += text
+                        if text:
+                            self._check_position_change()
+                            self._current_line_parts.append(text)
+                            self._last_text_x = self.tm[4]
+                            self._last_text_y = self.tm[5]
                     elif isinstance(item, PDFNumber):
                         val = float(item.value)
-                        if val < -50:
-                            self.current_text += ' '
+                        space_thresh = -self.current_font_size * 0.33 * 1000
+                        if val < space_thresh:
+                            self._current_line_parts.append(' ')
         elif op == "'":
             if operands and isinstance(operands[0], PDFString):
                 self.tm[5] -= self.current_font_size
-                self.current_text += '\n'
-                self.current_text += self._decode_string(operands[0])
+                self._flush_line()
+                self._last_text_x = None
+                self._last_text_y = self.tm[5]
+                text = self._decode_string(operands[0])
+                if text:
+                    self._current_line_parts.append(text)
+                    self._last_text_x = self.tm[4]
         elif op == '"':
             if len(operands) >= 3 and isinstance(operands[2], PDFString):
                 self.tm[5] -= self.current_font_size
-                self.current_text += '\n'
-                self.current_text += self._decode_string(operands[2])
+                self._flush_line()
+                self._last_text_x = None
+                self._last_text_y = self.tm[5]
+                text = self._decode_string(operands[2])
+                if text:
+                    self._current_line_parts.append(text)
+                    self._last_text_x = self.tm[4]
 
     def _decode_string(self, s: PDFString) -> str:
         if self.current_font and self.current_font in self.fonts:
@@ -1116,12 +1221,13 @@ class ContentStreamParser:
             if isinstance(tounicode, PDFStream):
                 cmap = self._parse_tounicode(tounicode.get_filtered_data())
                 if cmap:
+                    max_code_len = max((len(k) for k in cmap.keys()), default=2)
                     result = []
                     i = 0
                     data = s.value
                     while i < len(data):
                         matched = False
-                        for length in (2, 1):
+                        for length in range(max_code_len, 0, -1):
                             if i + length <= len(data):
                                 code = tuple(data[i:i + length])
                                 if code in cmap:
@@ -1143,6 +1249,44 @@ class ContentStreamParser:
                     return self._decode_winansi(s, enc)
         return self._decode_simple(s)
 
+    def _decode_unicode_bytes(self, data: bytes) -> str:
+        try:
+            result = []
+            i = 0
+            while i < len(data):
+                if i + 1 < len(data):
+                    code = (data[i] << 8) | data[i + 1]
+                    if 0xD800 <= code <= 0xDBFF and i + 3 < len(data):
+                        low = (data[i + 2] << 8) | data[i + 3]
+                        if 0xDC00 <= low <= 0xDFFF:
+                            unicode_val = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                            result.append(chr(unicode_val))
+                            i += 4
+                            continue
+                    result.append(chr(code))
+                    i += 2
+                else:
+                    result.append(chr(data[i]))
+                    i += 1
+            return ''.join(result)
+        except:
+            try:
+                return data.decode('utf-16-be')
+            except:
+                try:
+                    return data.decode('utf-8')
+                except:
+                    return data.decode('latin-1', errors='replace')
+
+    def _parse_tounicode_hex_tokens(self, text: str) -> List[bytes]:
+        results = []
+        for m in re.finditer(r'<([0-9A-Fa-f]+)>', text):
+            try:
+                results.append(bytes.fromhex(m.group(1)))
+            except:
+                pass
+        return results
+
     def _parse_tounicode(self, data: bytes) -> Dict[Tuple[int, ...], str]:
         cmap = {}
         try:
@@ -1155,36 +1299,74 @@ class ContentStreamParser:
                     line = line.strip()
                     if not line:
                         continue
-                    m2 = re.match(r'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>', line)
-                    if m2:
-                        src = bytes.fromhex(m2.group(1))
-                        dst = bytes.fromhex(m2.group(2))
-                        try:
-                            cmap[tuple(src)] = dst.decode('utf-16-be')
-                        except:
-                            try:
-                                cmap[tuple(src)] = dst.decode('utf-8')
-                            except:
-                                cmap[tuple(src)] = dst.decode('latin-1')
+                    if '[' in line and ']' in line:
+                        bracket_match = re.search(r'\[([^\]]*)\]', line)
+                        if bracket_match:
+                            arr_text = bracket_match.group(1)
+                            arr_tokens = self._parse_tounicode_hex_tokens(arr_text)
+                            for i in range(0, len(arr_tokens) - 1, 2):
+                                src = arr_tokens[i]
+                                dst = arr_tokens[i + 1]
+                                cmap[tuple(src)] = self._decode_unicode_bytes(dst)
+                            before = line[:bracket_match.start()]
+                            pre_tokens = self._parse_tounicode_hex_tokens(before)
+                            for i in range(0, len(pre_tokens) - 1, 2):
+                                src = pre_tokens[i]
+                                dst = pre_tokens[i + 1]
+                                cmap[tuple(src)] = self._decode_unicode_bytes(dst)
+                    else:
+                        tokens = self._parse_tounicode_hex_tokens(line)
+                        for i in range(0, len(tokens) - 1, 2):
+                            src = tokens[i]
+                            dst = tokens[i + 1]
+                            cmap[tuple(src)] = self._decode_unicode_bytes(dst)
             for m in bfrange_pattern.finditer(text):
                 block = m.group(1)
                 for line in block.strip().split('\n'):
                     line = line.strip()
                     if not line:
                         continue
-                    m2 = re.match(r'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>', line)
-                    if m2:
-                        src_start = int(m2.group(1), 16)
-                        src_end = int(m2.group(2), 16)
-                        dst_start = int(m2.group(3), 16)
-                        for i in range(src_end - src_start + 1):
-                            src = src_start + i
-                            dst = dst_start + i
-                            try:
-                                src_bytes = src.to_bytes((src.bit_length() + 7) // 8 or 1, 'big')
-                                cmap[tuple(src_bytes)] = chr(dst)
-                            except:
-                                pass
+                    if '[' in line and ']' in line:
+                        bracket_match = re.search(r'\[([^\]]*)\]', line)
+                        if bracket_match:
+                            before = line[:bracket_match.start()]
+                            pre_tokens = self._parse_tounicode_hex_tokens(before)
+                            arr_text = bracket_match.group(1)
+                            dst_list = self._parse_tounicode_hex_tokens(arr_text)
+                            if len(pre_tokens) >= 2 and dst_list:
+                                src_start_b = pre_tokens[0]
+                                src_end_b = pre_tokens[1]
+                                src_start = int.from_bytes(src_start_b, 'big')
+                                src_end = int.from_bytes(src_end_b, 'big')
+                                src_len = len(src_start_b)
+                                count = min(src_end - src_start + 1, len(dst_list))
+                                for i in range(count):
+                                    src_val = src_start + i
+                                    src_bytes = src_val.to_bytes(src_len, 'big')
+                                    cmap[tuple(src_bytes)] = self._decode_unicode_bytes(dst_list[i])
+                    else:
+                        tokens = self._parse_tounicode_hex_tokens(line)
+                        if len(tokens) >= 3:
+                            src_start_b = tokens[0]
+                            src_end_b = tokens[1]
+                            dst_start_b = tokens[2]
+                            src_start = int.from_bytes(src_start_b, 'big')
+                            src_end = int.from_bytes(src_end_b, 'big')
+                            src_len = len(src_start_b)
+                            dst_start = int.from_bytes(dst_start_b, 'big') if dst_start_b else 0
+                            dst_len = len(dst_start_b)
+                            for i in range(src_end - src_start + 1):
+                                try:
+                                    src_val = src_start + i
+                                    src_bytes = src_val.to_bytes(src_len, 'big')
+                                    dst_val = dst_start + i
+                                    if dst_len > 0:
+                                        dst_bytes = dst_val.to_bytes(dst_len, 'big')
+                                        cmap[tuple(src_bytes)] = self._decode_unicode_bytes(dst_bytes)
+                                    else:
+                                        cmap[tuple(src_bytes)] = chr(dst_val)
+                                except:
+                                    pass
         except:
             pass
         return cmap
@@ -1389,6 +1571,31 @@ def check_document(doc: PDFDocument) -> List[Dict]:
     return issues
 
 
+def repair_check_document(doc: PDFDocument) -> List[Dict]:
+    issues = check_document(doc)
+    for issue in issues:
+        itype = issue['type']
+        msg = issue['message']
+        suggestion = ""
+        if itype == 'xref_offset_invalid':
+            m = re.search(r'Object (\d+): xref offset', msg)
+            obj_num = m.group(1) if m else "?"
+            suggestion = f"建议：扫描文件中 '{obj_num} 0 obj' 的实际字节偏移量，更新 xref 表对应条目；或使用 qpdf --recover 重建交叉引用表。"
+        elif itype == 'xref_offset_mismatch':
+            suggestion = "建议：重新解析文件，在对象起始位置向前回溯查找 'obj' 关键字，校正偏移；检查是否存在多余空白字节。"
+        elif itype == 'broken_reference':
+            suggestion = "建议：检查被引用对象编号是否正确；如对象确实缺失，可创建占位对象（null 或空字典）并加入 xref 表，避免引用悬空。"
+        elif itype == 'free_object_reference':
+            suggestion = "建议：将 xref 中该对象条目改为 'n'（在用），或将文档中对该对象的引用移除/替换为有效对象。"
+        elif itype == 'stream_length_mismatch':
+            m = re.search(r'Object (\d+): stream declared length (\d+), actual (\d+)', msg)
+            if m:
+                obj_num, declared, actual = m.group(1), m.group(2), m.group(3)
+                suggestion = f"建议：将对象 {obj_num} 的 /Length 由 {declared} 修正为实际字节数 {actual}；或重新压缩 stream 数据使其与声明长度一致。"
+        issue['suggestion'] = suggestion
+    return issues
+
+
 def obj_to_jsonable(obj):
     if isinstance(obj, PDFNull):
         return None
@@ -1425,11 +1632,18 @@ def export_json(doc: PDFDocument) -> Dict:
         'version': doc.version,
         'trailer': obj_to_jsonable(doc.trailer) if doc.trailer else None,
         'objects': {},
+        'object_sources': {},
         'pages': []
     }
     for (obj_num, gen), obj in doc.objects.items():
         key = f"{obj_num}_{gen}"
         result['objects'][key] = obj_to_jsonable(obj)
+        src = doc.object_sources.get((obj_num, gen), "unknown")
+        result['object_sources'][key] = src
+    xref_src = {}
+    for obj_num, entry in doc.xref_entries.items():
+        xref_src[str(obj_num)] = entry.source
+    result['xref_sources'] = xref_src
     for page in doc.pages:
         pdata = {
             'page_num': page.page_num,
@@ -1524,13 +1738,27 @@ def cmd_info(doc: PDFDocument):
     in_use = sum(1 for e in doc.xref_entries.values() if e.in_use)
     free = total - in_use
     compressed = sum(1 for e in doc.xref_entries.values() if e.is_compressed)
+    src_direct = sum(1 for e in doc.xref_entries.values() if e.source == "direct_table")
+    src_xrefstm = sum(1 for e in doc.xref_entries.values() if e.source == "xref_stream")
     print_table(['Metric', 'Count'], [
         ['Total xref entries', str(total)],
         ['Objects in use', str(in_use)],
         ['Free objects', str(free)],
         ['Compressed objects', str(compressed)],
+        ['From direct xref table', str(src_direct)],
+        ['From xref stream', str(src_xrefstm)],
         ['Parsed objects', str(len(doc.objects))],
     ])
+    print()
+    print("=== Object Sources ===")
+    src_counts = {}
+    for k, src in doc.object_sources.items():
+        src_counts[src] = src_counts.get(src, 0) + 1
+    if src_counts:
+        src_rows = [[src, str(cnt)] for src, cnt in sorted(src_counts.items())]
+        print_table(['Source', 'Count'], src_rows)
+    else:
+        print("  (none tracked yet)")
     print()
     print("=== Trailer ===")
     if doc.trailer:
@@ -1645,6 +1873,29 @@ def cmd_check(doc: PDFDocument):
         sev = i['severity'].upper()
         rows.append([sev, i['type'], i['message']])
     print_table(['Severity', 'Type', 'Message'], rows)
+
+
+def cmd_repair_check(doc: PDFDocument, strict: bool = False):
+    issues = repair_check_document(doc)
+    if not issues:
+        print("No issues detected. PDF file is clean.")
+        return
+    high = sum(1 for i in issues if i['severity'] == 'high')
+    medium = sum(1 for i in issues if i['severity'] == 'medium')
+    low = sum(1 for i in issues if i['severity'] == 'low')
+    print(f"Issues found: {len(issues)} (high: {high}, medium: {medium}, low: {low})")
+    print()
+    for idx, i in enumerate(issues, 1):
+        sev = i['severity'].upper()
+        print(f"[{idx}] [{sev}] {i['type']}")
+        print(f"    {i['message']}")
+        if i.get('suggestion'):
+            print(f"    {i['suggestion']}")
+        print()
+    if strict and high > 0:
+        print(f"[STRICT MODE FAILED] Found {high} high-severity issue(s). Must be resolved before proceeding.")
+        return 1
+    return 0
 
 
 def cmd_export_json(doc: PDFDocument, output_path: str):
@@ -1776,6 +2027,9 @@ def main():
     p_search.add_argument('keyword', help='Search keyword')
     p_check = subparsers.add_parser('check', help='Check PDF for issues')
     p_check.add_argument('file', help='PDF file path')
+    p_repair = subparsers.add_parser('repair-check', help='Check PDF issues with repair suggestions')
+    p_repair.add_argument('file', help='PDF file path')
+    p_repair.add_argument('--strict', action='store_true', help='Fail if any high-severity issues exist')
     p_report = subparsers.add_parser('report', help='Generate HTML report')
     p_report.add_argument('file', help='PDF file path')
     p_report.add_argument('-o', '--output', required=True, help='Output HTML file')
@@ -1802,6 +2056,10 @@ def main():
         cmd_search(doc, args.keyword)
     elif args.command == 'check':
         cmd_check(doc)
+    elif args.command == 'repair-check':
+        rc = cmd_repair_check(doc, strict=args.strict)
+        if rc:
+            sys.exit(rc)
     elif args.command == 'report':
         cmd_report(doc, args.output)
     elif args.command == 'export-json':
